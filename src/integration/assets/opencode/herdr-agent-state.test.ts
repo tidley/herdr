@@ -311,10 +311,8 @@ function requestSessionID(request: unknown): unknown {
 }
 
 function requestParam(request: unknown, name: string): unknown {
-  if (!isRecord(request) || !isRecord(request.params)) {
-    return undefined;
-  }
-  return request.params[name];
+  if (!isRecord(request)) return undefined;
+  return isRecord(request.params) ? request.params[name] : request[name];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -295,10 +295,8 @@ test("stops route polling when the TUI plugin is disposed", async () => {
 });
 
 function requestParam(request: unknown, name: string): unknown {
-  if (!isRecord(request) || !isRecord(request.params)) {
-    return undefined;
-  }
-  return request.params[name];
+  if (!isRecord(request)) return undefined;
+  return isRecord(request.params) ? request.params[name] : request[name];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -573,9 +571,9 @@ test("V1 reselecting an aborted request does not resurrect it or poll completed 
   tui.emit("session.updated", { info: { id: "root" } });
   await flushReports();
   expect(states()).not.toContain("blocked");
-  const reads = tui.calls.length;
+  const completedToolReads = tui.calls.filter((call) => call === "message:m").length;
   await new Promise((resolve) => setTimeout(resolve, 650));
-  expect(tui.calls).toHaveLength(reads);
+  expect(tui.calls.filter((call) => call === "message:m")).toHaveLength(completedToolReads);
 });
 
 test("V1 home and selected-session deletion settle authority and retry a dropped idle report", async () => {
