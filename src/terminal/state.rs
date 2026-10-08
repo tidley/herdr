@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,24 @@ use std::time::{Duration, Instant};
 
 use crate::detect::{Agent, AgentState};
 use crate::terminal::TerminalId;
+
+#[derive(Debug, Clone)]
+pub struct ActiveAgentTurn {
+    session_ref: crate::agent_resume::AgentSessionRef,
+    request_id: String,
+    submitted: bool,
+    interrupt_requested: bool,
+    baseline_completion_id: Option<String>,
+    deadline: Option<Instant>,
+    result: Option<crate::api::schema::AgentTurnResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTurnReservation {
+    New,
+    Existing,
+    Busy,
+}
 
 #[path = "metadata.rs"]
 mod metadata;
@@ -155,6 +173,10 @@ pub struct TerminalState {
     pub state: AgentState,
     pub last_agent_state_change_seq: Option<u64>,
     pub last_agent_completion_seq: Option<u64>,
+    pub last_agent_completion: Option<crate::api::schema::AgentCompletion>,
+    active_agent_turn: Option<ActiveAgentTurn>,
+    settled_agent_turns: VecDeque<ActiveAgentTurn>,
+    reported_completion_ids: HashSet<(crate::agent_resume::AgentSessionRef, String)>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
@@ -165,6 +187,159 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
+    pub fn active_agent_turn(&self) -> Option<crate::api::schema::AgentTurnInfo> {
+        self.active_agent_turn
+            .as_ref()
+            .map(|turn| crate::api::schema::AgentTurnInfo {
+                request_id: turn.request_id.clone(),
+                submitted: turn.submitted,
+                settled: turn.result.is_some(),
+                result: turn.result.clone(),
+            })
+    }
+
+    pub fn recent_agent_turns(&self) -> Vec<crate::api::schema::AgentTurnInfo> {
+        self.settled_agent_turns
+            .iter()
+            .map(|turn| crate::api::schema::AgentTurnInfo {
+                request_id: turn.request_id.clone(),
+                submitted: turn.submitted,
+                settled: true,
+                result: turn.result.clone(),
+            })
+            .collect()
+    }
+
+    pub fn reserve_agent_turn(
+        &mut self,
+        session_ref: crate::agent_resume::AgentSessionRef,
+        request_id: String,
+        deadline: Option<Instant>,
+    ) -> AgentTurnReservation {
+        if let Some(turn) = self.active_agent_turn.as_ref() {
+            if turn.session_ref == session_ref && turn.request_id == request_id {
+                return AgentTurnReservation::Existing;
+            }
+            if turn.result.is_none() && turn.session_ref == session_ref {
+                return AgentTurnReservation::Busy;
+            }
+        }
+        if self
+            .settled_agent_turns
+            .iter()
+            .any(|turn| turn.session_ref == session_ref && turn.request_id == request_id)
+        {
+            return AgentTurnReservation::Existing;
+        }
+        if self
+            .active_agent_turn
+            .as_ref()
+            .is_some_and(|turn| turn.result.is_some())
+        {
+            let settled = self
+                .active_agent_turn
+                .take()
+                .expect("settled active turn exists");
+            self.settled_agent_turns.push_back(settled);
+        }
+        self.active_agent_turn = Some(ActiveAgentTurn {
+            session_ref,
+            request_id,
+            submitted: false,
+            interrupt_requested: false,
+            baseline_completion_id: self
+                .last_agent_completion
+                .as_ref()
+                .map(|completion| completion.id.clone()),
+            deadline,
+            result: None,
+        });
+        AgentTurnReservation::New
+    }
+
+    pub fn mark_agent_turn_submitted(&mut self) {
+        if let Some(turn) = self.active_agent_turn.as_mut() {
+            turn.submitted = true;
+        }
+    }
+
+    pub fn request_agent_turn_interrupt(&mut self) {
+        if let Some(turn) = self
+            .active_agent_turn
+            .as_mut()
+            .filter(|turn| turn.result.is_none())
+        {
+            turn.interrupt_requested = true;
+        }
+    }
+
+    pub fn settle_expired_agent_turn(&mut self, now: Instant) {
+        if self
+            .active_agent_turn
+            .as_ref()
+            .and_then(|turn| turn.deadline)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.settle_agent_turn(
+                None,
+                crate::api::schema::AgentTurnStatus::TimedOut,
+                String::new(),
+            );
+        }
+    }
+
+    pub fn fail_agent_turn(&mut self) {
+        self.settle_agent_turn(
+            None,
+            crate::api::schema::AgentTurnStatus::Failed,
+            String::new(),
+        );
+    }
+
+    pub fn reconcile_agent_turn(&mut self) {
+        self.settle_expired_agent_turn(Instant::now());
+        let failed = self.active_agent_turn.as_ref().is_some_and(|turn| {
+            turn.result.is_none() && !self.session_ref_is_current(&turn.session_ref)
+        });
+        if failed {
+            self.fail_agent_turn();
+            return;
+        }
+        let interrupted = self.active_agent_turn.as_ref().is_some_and(|turn| {
+            turn.result.is_none()
+                && turn.interrupt_requested
+                && !matches!(self.state, AgentState::Working | AgentState::Blocked)
+        });
+        if interrupted {
+            self.settle_agent_turn(
+                None,
+                crate::api::schema::AgentTurnStatus::Interrupted,
+                String::new(),
+            );
+        }
+    }
+
+    fn settle_agent_turn(
+        &mut self,
+        completion_id: Option<String>,
+        status: crate::api::schema::AgentTurnStatus,
+        text: String,
+    ) {
+        let Some(turn) = self
+            .active_agent_turn
+            .as_mut()
+            .filter(|turn| turn.result.is_none())
+        else {
+            return;
+        };
+        turn.result = Some(crate::api::schema::AgentTurnResult {
+            request_id: turn.request_id.clone(),
+            completion_id,
+            status,
+            text,
+        });
+    }
+
     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
         Self {
             id,
@@ -195,6 +370,10 @@ impl TerminalState {
             state: AgentState::Unknown,
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
+            last_agent_completion: None,
+            active_agent_turn: None,
+            settled_agent_turns: VecDeque::new(),
+            reported_completion_ids: HashSet::new(),
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
@@ -810,6 +989,7 @@ impl TerminalState {
             session_ref,
         });
         let current_session = self.current_session_identity_for_persistence();
+        self.clear_agent_completions_if_session_changed(&previous_session, &current_session);
         let effective_state_change = self.recompute_effective_state(
             previous_agent_label,
             previous_known_agent,
@@ -1446,6 +1626,9 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        if self.persisted_agent_session.as_ref() != Some(&session) {
+            self.clear_agent_completions();
+        }
         self.persisted_agent_session = Some(session);
     }
 
@@ -1453,7 +1636,7 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
-        self.persisted_agent_session = Some(session.clone());
+        self.set_persisted_agent_session(session.clone());
         self.managed_agent_launch_session = Some(session);
     }
 
@@ -1695,8 +1878,9 @@ impl TerminalState {
         if self.managed_agent_launch_session.as_ref() == Some(&persisted_session) {
             self.managed_agent_launch_session = None;
         }
-        self.persisted_agent_session = Some(persisted_session);
+        self.set_persisted_agent_session(persisted_session);
         let current_session = self.current_session_identity_for_persistence();
+        self.clear_agent_completions_if_session_changed(&previous_session, &current_session);
         if previous_session.is_some() && previous_session != current_session {
             // Rebinding can expose a cached Working screen; only a fresh report ends acquisition.
             self.agent_process_acquisition_pending = true;
@@ -1814,6 +1998,7 @@ impl TerminalState {
             self.forget_reported_resume_of(&authority.source, &authority.agent_label);
         }
         self.persisted_agent_session = None;
+        self.clear_agent_completions_if_session_changed(&previous_session, &None);
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1880,6 +2065,7 @@ impl TerminalState {
             self.persisted_agent_session = None;
         }
         let current_session = self.current_session_identity_for_persistence();
+        self.clear_agent_completions_if_session_changed(&previous_session, &current_session);
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1924,6 +2110,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.clear_agent_name();
         let current_session = self.current_session_identity_for_persistence();
+        self.clear_agent_completions_if_session_changed(&previous_session, &current_session);
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1945,6 +2132,60 @@ impl TerminalState {
             .is_some_and(|(_, _, kind, value)| {
                 kind == session_ref.kind && value == session_ref.value
             })
+    }
+
+    pub fn record_agent_completion(
+        &mut self,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        completion: crate::api::schema::AgentCompletion,
+    ) -> bool {
+        let key = (session_ref.clone(), completion.id.clone());
+        if !self.session_ref_is_current(session_ref) || !self.reported_completion_ids.insert(key) {
+            return false;
+        }
+        let settles_turn = self.active_agent_turn.as_ref().is_some_and(|turn| {
+            turn.result.is_none()
+                && turn.session_ref == *session_ref
+                && turn.submitted
+                && turn.baseline_completion_id.as_deref() != Some(completion.id.as_str())
+        });
+        if settles_turn {
+            self.settle_agent_turn(
+                Some(completion.id.clone()),
+                crate::api::schema::AgentTurnStatus::Completed,
+                completion.text.clone(),
+            );
+        }
+        self.last_agent_completion = Some(completion);
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    fn clear_agent_completions_if_session_changed(
+        &mut self,
+        previous: &Option<(
+            String,
+            String,
+            crate::agent_resume::AgentSessionRefKind,
+            String,
+        )>,
+        current: &Option<(
+            String,
+            String,
+            crate::agent_resume::AgentSessionRefKind,
+            String,
+        )>,
+    ) {
+        if previous != current {
+            self.clear_agent_completions();
+            self.reconcile_agent_turn();
+        }
+    }
+
+    fn clear_agent_completions(&mut self) {
+        self.last_agent_completion = None;
+        self.reported_completion_ids.clear();
+        self.settled_agent_turns.clear();
     }
 
     /// A reporter may own the resume command when it holds the pane, or when it
@@ -2357,6 +2598,7 @@ impl TerminalState {
         self.state = AgentState::Unknown;
         self.last_agent_state_change_seq = None;
         self.last_agent_completion_seq = None;
+        self.clear_agent_completions();
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.recent_agent_process_exit = None;
@@ -2750,6 +2992,212 @@ mod tests {
 
             assert_eq!(terminal.state, AgentState::Working);
         }
+    }
+
+    #[test]
+    fn active_turn_dedupes_the_same_request_and_rejects_a_concurrent_request() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let session = crate::agent_resume::AgentSessionRef::id("turn-session").unwrap();
+        terminal.set_hook_authority_at(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Idle,
+            None,
+            Some(session.clone()),
+            Some(1),
+            Instant::now(),
+        );
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:opencode".into(),
+            agent: "opencode".into(),
+            session_ref: session.clone(),
+        });
+
+        assert_eq!(
+            terminal.reserve_agent_turn(session.clone(), "one".into(), None),
+            AgentTurnReservation::New
+        );
+        assert_eq!(
+            terminal.reserve_agent_turn(session.clone(), "one".into(), None),
+            AgentTurnReservation::Existing
+        );
+        assert_eq!(
+            terminal.reserve_agent_turn(session, "two".into(), None),
+            AgentTurnReservation::Busy
+        );
+    }
+
+    #[test]
+    fn active_turn_ignores_stale_completion_and_settles_first_new_completion() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let session = crate::agent_resume::AgentSessionRef::id("turn-session").unwrap();
+        terminal.set_hook_authority_at(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Idle,
+            None,
+            Some(session.clone()),
+            Some(1),
+            Instant::now(),
+        );
+        terminal.reserve_agent_turn(session, "turn".into(), None);
+        terminal.mark_agent_turn_submitted();
+        terminal.settle_agent_turn(
+            Some("new".into()),
+            crate::api::schema::AgentTurnStatus::Completed,
+            "done".into(),
+        );
+        let result = terminal.active_agent_turn().unwrap().result.unwrap();
+        assert_eq!(
+            result.status,
+            crate::api::schema::AgentTurnStatus::Completed
+        );
+        assert_eq!(result.text, "done");
+    }
+
+    #[test]
+    fn interrupted_turn_waits_for_the_agent_to_leave_active_state() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let session = crate::agent_resume::AgentSessionRef::id("turn-session").unwrap();
+        terminal.set_hook_authority_at(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Working,
+            None,
+            Some(session.clone()),
+            Some(1),
+            Instant::now(),
+        );
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:opencode".into(),
+            agent: "opencode".into(),
+            session_ref: session.clone(),
+        });
+        terminal.reserve_agent_turn(session, "turn".into(), None);
+        terminal.mark_agent_turn_submitted();
+        terminal.request_agent_turn_interrupt();
+        terminal.reconcile_agent_turn();
+        assert!(!terminal.active_agent_turn().unwrap().settled);
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal.reconcile_agent_turn();
+        assert_eq!(
+            terminal.active_agent_turn().unwrap().result.unwrap().status,
+            crate::api::schema::AgentTurnStatus::Interrupted
+        );
+    }
+
+    #[test]
+    fn session_only_replacement_clears_completion_history() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Devin), AgentState::Idle);
+        let first = crate::agent_resume::AgentSessionRef::id("first").unwrap();
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:devin".into(),
+            "devin".into(),
+            Some(first.clone()),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.record_agent_completion(
+            &first,
+            crate::api::schema::AgentCompletion {
+                id: "one".into(),
+                text: "one".into(),
+            },
+        );
+
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:devin".into(),
+            agent: "devin".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("second").unwrap(),
+        });
+
+        assert!(terminal.last_agent_completion.is_none());
+        assert!(terminal.reported_completion_ids.is_empty());
+    }
+
+    #[test]
+    fn settled_turns_remain_idempotent_after_more_than_32_turns() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let session = crate::agent_resume::AgentSessionRef::id("session").unwrap();
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:codex".into(),
+            "codex".into(),
+            Some(session.clone()),
+            Some(1),
+            Some("startup".into()),
+        );
+        for index in 0..34 {
+            assert_eq!(
+                terminal.reserve_agent_turn(session.clone(), index.to_string(), None),
+                AgentTurnReservation::New
+            );
+            terminal.settle_agent_turn(
+                Some(index.to_string()),
+                crate::api::schema::AgentTurnStatus::Completed,
+                String::new(),
+            );
+        }
+
+        assert_eq!(
+            terminal.reserve_agent_turn(session, "0".into(), None),
+            AgentTurnReservation::Existing
+        );
+    }
+
+    #[test]
+    fn old_completion_ids_do_not_settle_newer_turns() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let session = crate::agent_resume::AgentSessionRef::id("session").unwrap();
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:codex".into(),
+            "codex".into(),
+            Some(session.clone()),
+            Some(1),
+            Some("startup".into()),
+        );
+        for index in 0..33 {
+            terminal.record_agent_completion(
+                &session,
+                crate::api::schema::AgentCompletion {
+                    id: index.to_string(),
+                    text: index.to_string(),
+                },
+            );
+        }
+
+        terminal.reserve_agent_turn(session.clone(), "new-turn".into(), None);
+        terminal.mark_agent_turn_submitted();
+
+        assert!(!terminal.record_agent_completion(
+            &session,
+            crate::api::schema::AgentCompletion {
+                id: "0".into(),
+                text: "old".into()
+            }
+        ));
+        assert!(!terminal.active_agent_turn().unwrap().settled);
+        assert!(terminal.record_agent_completion(
+            &session,
+            crate::api::schema::AgentCompletion {
+                id: "fresh".into(),
+                text: "done".into()
+            }
+        ));
+        assert_eq!(
+            terminal
+                .active_agent_turn()
+                .unwrap()
+                .result
+                .unwrap()
+                .completion_id,
+            Some("fresh".into())
+        );
     }
 
     #[test]

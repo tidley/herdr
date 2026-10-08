@@ -17,6 +17,9 @@ mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
+#[allow(dead_code)]
+pub(crate) mod embedded;
+mod embedded_report;
 mod git_refresh;
 mod ids;
 mod popup;
@@ -78,6 +81,13 @@ pub(crate) struct AppPolicy {
 }
 
 impl AppPolicy {
+    pub(crate) const EMBEDDED: Self = Self {
+        restore_session: false,
+        persist_session: false,
+        persist_plugin_registry: false,
+        background_updates: false,
+    };
+
     pub(crate) const PRODUCTION: Self = Self {
         restore_session: true,
         persist_session: true,

@@ -3406,6 +3406,7 @@ action = "missing"
                 agent: "codex".into(),
                 state: crate::api::schema::PaneAgentState::Working,
                 message: None,
+                completion: None,
                 seq: None,
                 agent_session_id: None,
                 agent_session_path: None,

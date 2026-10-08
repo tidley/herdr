@@ -108,6 +108,7 @@ pub enum AppEvent {
         agent_label: String,
         state: AgentState,
         message: Option<String>,
+        completion: Option<crate::api::schema::AgentCompletion>,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
     },

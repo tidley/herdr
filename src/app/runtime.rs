@@ -196,8 +196,7 @@ impl App {
         changed
     }
 
-    #[cfg(test)]
-    fn drain_internal_events_up_to(&mut self, limit: usize) -> (bool, bool) {
+    pub(crate) fn drain_internal_events_up_to(&mut self, limit: usize) -> (bool, bool) {
         let mut had_event = false;
         let mut changed = false;
         for _ in 0..limit {

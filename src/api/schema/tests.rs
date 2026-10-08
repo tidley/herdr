@@ -153,6 +153,63 @@ fn agent_start_and_prompt_requests_round_trip() {
 }
 
 #[test]
+fn agent_turn_request_uses_a_distinct_request_id_and_typed_result() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "socket-request",
+        "method": "agent.turn",
+        "params": {
+            "target": "reviewer",
+            "request_id": "ribbit-request",
+            "text": "review this",
+            "timeout_ms": 30_000
+        }
+    }))
+    .unwrap();
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.turn");
+    assert_eq!(json["params"]["request_id"], "ribbit-request");
+    assert_eq!(json["params"]["timeout_ms"], 30_000);
+}
+
+#[test]
+fn agent_interrupt_request_round_trips() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "interrupt",
+        "method": "agent.interrupt",
+        "params": { "target": "reviewer" }
+    }))
+    .unwrap();
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.interrupt");
+    assert_eq!(json["params"]["target"], "reviewer");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+}
+
+#[test]
+fn pane_report_agent_completion_round_trips() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "completion",
+        "method": "pane.report_agent",
+        "params": {
+            "pane_id": "w1:p2",
+            "source": "herdr:opencode",
+            "agent": "opencode",
+            "state": "idle",
+            "agent_session_id": "session-1",
+            "completion": { "id": "message-1", "text": "Finished." }
+        }
+    }))
+    .unwrap();
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["params"]["completion"]["id"], "message-1");
+    assert_eq!(json["params"]["completion"]["text"], "Finished.");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+}
+
+#[test]
 fn bundled_protocol_schema_refs_resolve_inside_bundle() {
     fn assert_no_standalone_refs(value: &serde_json::Value) {
         match value {
@@ -727,6 +784,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_turn: false,
             }),
         },
     };

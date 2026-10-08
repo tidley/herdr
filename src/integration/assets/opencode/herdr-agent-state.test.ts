@@ -4,6 +4,7 @@ const originalArgv = process.argv;
 afterEach(() => { process.argv = originalArgv; });
 
 const requests: unknown[] = [];
+const endpoints: string[] = [];
 const clients: FakeClient[] = [];
 const requestWaiters: Array<() => void> = [];
 let autoAcknowledge = true;
@@ -16,6 +17,7 @@ type FakeClient = {
 mock.module("node:net", () => ({
   default: {
     createConnection(_path: string, onConnect: () => void) {
+      endpoints.push(_path);
       const handlers = new Map<string, () => void>();
       const client = {
         write(input: string) {
@@ -43,6 +45,7 @@ mock.module("node:net", () => ({
 
 beforeEach(() => {
   requests.length = 0;
+  endpoints.length = 0;
   clients.length = 0;
   requestWaiters.length = 0;
   autoAcknowledge = true;
@@ -50,6 +53,8 @@ beforeEach(() => {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = "test.sock";
   process.env.HERDR_PANE_ID = "test:p1";
+  delete process.env.HERDR_PANE_REPORT_SOCKET;
+  delete process.env.HERDR_PANE_REPORT_TOKEN;
 });
 
 async function loadPlugin() {
@@ -93,6 +98,37 @@ test("serializes lifecycle reports", async () => {
   const sequences = requests.map(requestSeq);
   expect(sequences[0]).toEqual(expect.any(Number));
   expect(sequences[1]).toBe((sequences[0] as number) + 1);
+});
+
+test("uses the private pane report channel without a pane id", async () => {
+  delete process.env.HERDR_SOCKET_PATH;
+  delete process.env.HERDR_PANE_ID;
+  process.env.HERDR_PANE_REPORT_SOCKET = "private.sock";
+  process.env.HERDR_PANE_REPORT_TOKEN = "secret";
+  const plugin = await loadPlugin();
+
+  await plugin["chat.message"]({ sessionID: "root-session" });
+
+  expect(requests).toHaveLength(1);
+  expect(requestParam(requests[0], "token")).toBe("secret");
+  expect(requestParam(requests[0], "pane_id")).toBeUndefined();
+});
+
+test("normalizes a private report socket to a Windows named pipe", async () => {
+  delete process.env.HERDR_SOCKET_PATH;
+  delete process.env.HERDR_PANE_ID;
+  process.env.HERDR_PANE_REPORT_SOCKET = "private.sock";
+  process.env.HERDR_PANE_REPORT_TOKEN = "secret";
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "win32" });
+  try {
+    const plugin = await loadPlugin();
+    await plugin["chat.message"]({ sessionID: "root-session" });
+  } finally {
+    Object.defineProperty(process, "platform", platform!);
+  }
+
+  expect(endpoints).toEqual(["\\\\.\\pipe\\private.sock"]);
 });
 
 test("suppresses redundant same-session updates", async () => {

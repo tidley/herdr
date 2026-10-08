@@ -184,6 +184,45 @@ pub struct AgentPromptParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTurnParams {
+    pub target: String,
+    pub request_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) deadline: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTurnStatus {
+    Completed,
+    Interrupted,
+    TimedOut,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTurnResult {
+    pub request_id: String,
+    pub completion_id: Option<String>,
+    pub status: AgentTurnStatus,
+    pub text: String,
+}
+
+/// The server-owned state of the one turn currently associated with a pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTurnInfo {
+    pub request_id: String,
+    pub submitted: bool,
+    pub settled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<AgentTurnResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,11 +260,24 @@ pub struct AgentInfo {
     /// The current idle transition completed work, independently of who has viewed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_seq: Option<u64>,
+    /// The latest unique completion reported for the current agent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<AgentCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn: Option<AgentTurnInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_turns: Vec<AgentTurnInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentCompletion {
+    pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

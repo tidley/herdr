@@ -33,6 +33,109 @@ fn append_codex_paste_boundary(runtime: &crate::terminal::TerminalRuntime, text:
 }
 
 impl App {
+    pub(crate) fn submit_embedded_agent_turn(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        request_id: String,
+        text: &str,
+        deadline: std::time::Instant,
+    ) -> Option<crate::api::schema::AgentTurnResult> {
+        if text.is_empty() {
+            return None;
+        }
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return None;
+        };
+        if terminal.effective_known_agent() != Some(crate::detect::Agent::OpenCode) {
+            return None;
+        }
+        let Some(session_ref) = terminal
+            .persisted_agent_session
+            .as_ref()
+            .filter(|session| session.source == "herdr:opencode" && session.agent == "opencode")
+            .map(|session| session.session_ref.clone())
+        else {
+            return None;
+        };
+        let Some(runtime) = self.terminal_runtimes.get(terminal_id) else {
+            return None;
+        };
+        if !super::super::agents::runtime_hosts_agent(runtime, crate::detect::Agent::OpenCode) {
+            return None;
+        }
+        let reservation = self
+            .state
+            .terminals
+            .get_mut(terminal_id)
+            .expect("terminal was validated")
+            .reserve_agent_turn(session_ref, request_id.clone(), Some(deadline));
+        if reservation == crate::terminal::AgentTurnReservation::Busy {
+            return None;
+        }
+        if reservation == crate::terminal::AgentTurnReservation::Existing {
+            return self.embedded_agent_turn_result(terminal_id, &request_id);
+        }
+        let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, text);
+        if runtime
+            .queue_user_input_submission(
+                Bytes::from(text),
+                Bytes::from(enter),
+                AGENT_PROMPT_SUBMIT_DELAY,
+                None,
+            )
+            .is_err()
+        {
+            self.state
+                .terminals
+                .get_mut(terminal_id)
+                .expect("terminal was validated")
+                .fail_agent_turn();
+        } else {
+            self.state
+                .terminals
+                .get_mut(terminal_id)
+                .expect("terminal was validated")
+                .mark_agent_turn_submitted();
+        }
+        self.embedded_agent_turn_result(terminal_id, &request_id)
+    }
+
+    pub(crate) fn interrupt_embedded_agent(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> bool {
+        let Some(runtime) = self.terminal_runtimes.get(terminal_id) else {
+            return false;
+        };
+        if runtime.try_send_bytes(Bytes::from_static(b"\x03")).is_err() {
+            return false;
+        }
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            terminal.request_agent_turn_interrupt();
+        }
+        true
+    }
+
+    pub(crate) fn embedded_agent_turn_result(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        request_id: &str,
+    ) -> Option<crate::api::schema::AgentTurnResult> {
+        let terminal = self.state.terminals.get_mut(terminal_id)?;
+        terminal.reconcile_agent_turn();
+        terminal
+            .active_agent_turn()
+            .filter(|turn| turn.request_id == request_id)
+            .and_then(|turn| turn.result)
+            .or_else(|| {
+                terminal
+                    .recent_agent_turns()
+                    .into_iter()
+                    .find(|turn| turn.request_id == request_id)
+                    .and_then(|turn| turn.result)
+            })
+    }
+
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
         encode_success(
             id,
@@ -44,6 +147,18 @@ impl App {
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
         self.reconcile_managed_agent_target(&target.target);
+        if let Ok(resolved) = self.resolve_agent_target(&target.target) {
+            if let Some(terminal_id) = self
+                .state
+                .workspaces
+                .get(resolved.ws_idx)
+                .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            {
+                if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+                    terminal.reconcile_agent_turn();
+                }
+            }
+        }
         let agent = match self.agent_info_for_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -385,7 +500,147 @@ impl App {
         id: String,
         params: AgentSendKeysParams,
     ) -> String {
-        let resolved = match self.resolve_agent_target(&params.target) {
+        self.send_agent_keys(id, params.target, params.keys)
+    }
+
+    pub(crate) fn handle_runtime_agent_interrupt(
+        &mut self,
+        id: String,
+        target: AgentTarget,
+    ) -> String {
+        let resolved = self.resolve_agent_target(&target.target).ok();
+        let response = self.send_agent_keys(id, target.target, vec!["ctrl+c".into()]);
+        if serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok() {
+            if let Some(resolved) = resolved {
+                if let Some(terminal_id) = self
+                    .state
+                    .workspaces
+                    .get(resolved.ws_idx)
+                    .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+                {
+                    if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+                        terminal.request_agent_turn_interrupt();
+                    }
+                }
+            }
+        }
+        response
+    }
+
+    pub(crate) fn handle_runtime_agent_turn(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentTurnParams,
+    ) -> String {
+        if params
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return encode_error(id, "timeout", "timed out before reserving agent turn");
+        }
+        let validated = match self.validate_agent_prompt(
+            id.clone(),
+            &crate::api::schema::AgentPromptParams {
+                target: params.target.clone(),
+                text: params.text.clone(),
+                wait: None,
+            },
+        ) {
+            Ok(validated) => validated,
+            Err(response) => return response,
+        };
+        let Some(session) = validated.agent.agent_session.as_ref() else {
+            return encode_error(
+                id,
+                "agent_turn_unavailable",
+                "agent.turn requires an active reported agent session",
+            );
+        };
+        if validated.agent.agent.as_deref() != Some("opencode")
+            || session.source != "herdr:opencode"
+        {
+            return encode_error(
+                id,
+                "agent_turn_unavailable",
+                "agent.turn requires an active OpenCode session",
+            );
+        }
+        let session_ref = crate::agent_resume::AgentSessionRef {
+            kind: session.kind,
+            value: session.value.clone(),
+        };
+        let terminal_id = self.state.workspaces[validated.ws_idx]
+            .terminal_id(validated.pane_id)
+            .cloned()
+            .expect("validated pane has terminal");
+        let reservation = {
+            let terminal = self
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("validated terminal exists");
+            terminal.reconcile_agent_turn();
+            if terminal.active_agent_turn().is_none()
+                && matches!(
+                    terminal.state,
+                    crate::detect::AgentState::Working | crate::detect::AgentState::Blocked
+                )
+            {
+                return encode_error(
+                    id,
+                    "agent_turn_busy",
+                    "agent is already active without a managed turn",
+                );
+            }
+            terminal.reserve_agent_turn(session_ref, params.request_id, params.deadline)
+        };
+        if reservation == crate::terminal::AgentTurnReservation::Busy {
+            return encode_error(
+                id,
+                "agent_turn_busy",
+                "a turn is already active for this agent session",
+            );
+        }
+        if reservation == crate::terminal::AgentTurnReservation::New {
+            if let Err(response) = self.submit_agent_prompt(
+                validated,
+                &crate::api::schema::AgentPromptParams {
+                    target: params.target.clone(),
+                    text: params.text,
+                    wait: None,
+                },
+            ) {
+                self.state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .expect("terminal exists")
+                    .fail_agent_turn();
+                return response;
+            }
+            self.state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("terminal exists")
+                .mark_agent_turn_submitted();
+            if params
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                self.state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .expect("terminal exists")
+                    .settle_expired_agent_turn(std::time::Instant::now());
+            }
+        }
+        let agent = self
+            .agent_info_for_target(&params.target)
+            .expect("validated agent remains addressable");
+        encode_success(id, ResponseResult::AgentInfo { agent })
+    }
+
+    fn send_agent_keys(&mut self, id: String, target: String, keys: Vec<String>) -> String {
+        let resolved = match self.resolve_agent_target(&target) {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
@@ -395,7 +650,7 @@ impl App {
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
         else {
-            return agent_not_found(id, &params.target);
+            return agent_not_found(id, &target);
         };
         let Some(expected_agent) = self
             .state
@@ -403,15 +658,15 @@ impl App {
             .get(terminal_id)
             .and_then(|terminal| terminal.effective_known_agent())
         else {
-            return agent_not_ready(id, &params.target);
+            return agent_not_ready(id, &target);
         };
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
+            return agent_not_found(id, &target);
         };
         if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            return agent_not_ready(id, &params.target);
+            return agent_not_ready(id, &target);
         }
-        let encoded = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
+        let encoded = match super::super::api_helpers::encode_api_keys(runtime, &keys) {
             Ok(encoded) => encoded,
             Err(key) => {
                 return encode_error(id, "invalid_key", format!("unsupported key {key}"));
@@ -849,6 +1104,34 @@ mod tests {
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[A\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_interrupt_sends_encoded_control_c_to_the_target_agent() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "interrupt",
+            "method": "agent.interrupt",
+            "params": { "target": "reviewer" }
+        }))
+        .unwrap();
+        let response = app.handle_api_request(request);
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "interrupt");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x03"));
         assert!(rx.try_recv().is_err());
     }
 

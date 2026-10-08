@@ -20,6 +20,71 @@ fn valid_agent_name(name: &str) -> bool {
 }
 
 impl App {
+    /// Starts OpenCode in an already-created embedded terminal. This is the
+    /// direct App operation used by the library runtime; it does not use the
+    /// socket API or an external OpenCode endpoint.
+    pub(crate) fn start_embedded_opencode(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        name: String,
+        args: &[String],
+        timeout: Duration,
+    ) -> std::io::Result<()> {
+        if args.iter().any(|arg| arg.chars().any(char::is_control)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "OpenCode arguments cannot contain control characters",
+            ));
+        }
+        if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                INVALID_AGENT_TIMEOUT_MESSAGE,
+            ));
+        }
+        let runtime = self.terminal_runtimes.get(terminal_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "embedded terminal is unavailable",
+            )
+        })?;
+        let shell_name = available_shell_name(runtime).ok_or_else(|| {
+            std::io::Error::other("embedded terminal is not an interactive shell")
+        })?;
+        let mut argv =
+            vec![
+                crate::detect::interactive_agent_executable(crate::detect::Agent::OpenCode)
+                    .to_string(),
+            ];
+        argv.extend(args.iter().cloned());
+        let command =
+            crate::platform::interactive_shell_command(&argv, &shell_name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "OpenCode arguments cannot be encoded safely",
+                )
+            })?;
+        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
+        let terminal = self.state.terminals.get_mut(terminal_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "embedded terminal is unavailable",
+            )
+        })?;
+        terminal.begin_managed_agent(
+            name,
+            crate::detect::Agent::OpenCode,
+            Instant::now(),
+            AGENT_START_SETTLE_DELAY,
+            timeout,
+        );
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            terminal.clear_agent_name();
+            return Err(std::io::Error::other(err));
+        }
+        Ok(())
+    }
+
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
         self.state
             .workspaces
@@ -396,6 +461,9 @@ impl App {
             interactive_ready: terminal.managed_agent_interactive_ready(),
             state_change_seq: terminal.last_agent_state_change_seq.unwrap_or(0),
             completion_seq: terminal.last_agent_completion_seq,
+            completion: terminal.last_agent_completion.clone(),
+            active_turn: terminal.active_agent_turn(),
+            recent_turns: terminal.recent_agent_turns(),
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,

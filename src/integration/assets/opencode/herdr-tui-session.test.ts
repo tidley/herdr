@@ -8,10 +8,12 @@ let importCounter = 0;
 let holdConnections = false;
 let failConnections = false;
 const connections: Array<() => void> = [];
+const endpoints: string[] = [];
 
 mock.module("node:net", () => ({
   default: {
     createConnection(_path: string, onConnect: () => void) {
+      endpoints.push(_path);
       const handlers = new Map<string, () => void>();
       const client = {
         destroyed: false,
@@ -51,9 +53,12 @@ beforeEach(() => {
   holdConnections = false;
   failConnections = false;
   connections.length = 0;
+  endpoints.length = 0;
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = "test.sock";
   process.env.HERDR_PANE_ID = "test:p1";
+  delete process.env.HERDR_PANE_REPORT_SOCKET;
+  delete process.env.HERDR_PANE_REPORT_TOKEN;
 });
 
 afterEach(() => {
@@ -74,6 +79,7 @@ function fakeApi() {
   const permissions: Array<{ id: string; sessionID: string; tool?: { messageID: string; callID: string } }> = [];
   const questions: typeof permissions = [];
   const messages = new Map<string, { info?: { error?: { name: string } }; parts: Array<object> }>();
+  const sessionMessages = new Map<string, Array<{ id: string; role: string; parts: Array<object> }>>();
   const listeners = new Map<string, Set<(event: object) => void>>();
   const calls: string[] = [];
   let current: { name: string; params?: { sessionID: string } } = { name: "home" };
@@ -100,6 +106,10 @@ function fakeApi() {
             const data = messages.get(messageID);
             if (!data) throw new Error("message unavailable");
             return { data };
+          },
+          async messages({ sessionID }: { sessionID: string }) {
+            calls.push(`messages:${sessionID}`);
+            return { data: sessionMessages.get(sessionID) ?? [] };
           },
         },
         permission: { async list() { return { data: [...permissions] }; } },
@@ -134,6 +144,9 @@ function fakeApi() {
     addSession(session: { id: string; parentID?: string }) {
       sessions.set(session.id, session);
     },
+    setMessages(sessionID: string, messages: Array<{ id: string; role: string; parts: Array<object> }>) {
+      sessionMessages.set(sessionID, messages);
+    },
     select(sessionID: string) {
       current = { name: "session", params: { sessionID } };
     },
@@ -166,6 +179,60 @@ test("reports a root session when only the local route changes", async () => {
   expect(requestParam(requests[0], "agent_session_id")).toBe("session-a");
   expect(requestParam(requests[0], "session_start_source")).toBe("select");
   expect(requestParam(requests[0], "seq")).toBeUndefined();
+});
+
+test("uses the private pane report channel without a pane id", async () => {
+  delete process.env.HERDR_SOCKET_PATH;
+  delete process.env.HERDR_PANE_ID;
+  process.env.HERDR_PANE_REPORT_SOCKET = "private.sock";
+  process.env.HERDR_PANE_REPORT_TOKEN = "secret";
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  tui.addSession({ id: "session-a" });
+  tui.select("session-a");
+  await plugin.tui(tui.api);
+  await flushReports();
+
+  expect(requestParam(requests[0], "token")).toBe("secret");
+  expect(requestParam(requests[0], "pane_id")).toBeUndefined();
+});
+
+test("normalizes the private pane report socket to a Windows named pipe", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: "win32" });
+  delete process.env.HERDR_SOCKET_PATH;
+  delete process.env.HERDR_PANE_ID;
+  process.env.HERDR_PANE_REPORT_SOCKET = "private.sock";
+  process.env.HERDR_PANE_REPORT_TOKEN = "secret";
+  try {
+    const plugin = await loadPlugin();
+    const tui = fakeApi();
+    tui.addSession({ id: "session-a" });
+    tui.select("session-a");
+    await plugin.tui(tui.api);
+    await flushReports();
+
+    expect(endpoints[0]).toBe("\\\\.\\pipe\\private.sock");
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
+});
+
+test("reports the latest root assistant text atomically with idle", async () => {
+  const plugin = await loadPlugin();
+  const tui = fakeApi();
+  tui.addSession({ id: "session-a" });
+  tui.setMessages("session-a", [
+    { id: "user-1", role: "user", parts: [{ type: "text", text: "Hello" }] },
+    { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "Finished." }] },
+  ]);
+  tui.select("session-a");
+
+  await plugin.tui(tui.api);
+  await flushReports();
+
+  const idle = requests.find((request) => requestParam(request, "state") === "idle");
+  expect(requestParam(idle, "completion")).toEqual({ id: "assistant-1", text: "Finished." });
 });
 
 test("retries an initial selection while Herdr detects the process", async () => {
@@ -248,6 +315,7 @@ function v2Api() {
   const listeners = new Set<(event: unknown) => void>();
   const permissions = new Map<string, Array<{ id: string }> | undefined>();
   const forms = new Map<string, Array<{ id: string }> | undefined>();
+  const messages = new Map<string, Array<{ id: string; type: string; content: string }>>();
   return {
     api: {
       ui: { router: { current: () => route } },
@@ -258,6 +326,7 @@ function v2Api() {
           status: () => "idle",
           permission: { list: (id: string) => permissions.get(id) },
           form: { list: (id: string) => forms.get(id) },
+          message: { list: (id: string) => messages.get(id) },
         },
         listen: (handler: (event: unknown) => void) => {
           listeners.add(handler);
@@ -274,6 +343,7 @@ function v2Api() {
     sessions,
     permissions,
     forms,
+    messages,
   };
 }
 
@@ -576,6 +646,21 @@ test("V2 completes and interrupts without legacy idle events", async () => {
     expect(states()).toEqual(["working", terminal === "failed" ? "blocked" : "idle"]);
     dispose();
   }
+});
+
+test("V2 reports the latest assistant message content with idle", async () => {
+  const plugin = await loadPlugin();
+  const tui = v2Api();
+  tui.messages.set("a", [
+    { id: "user", type: "user", content: "Hello" },
+    { id: "assistant", type: "assistant", content: "Done." },
+  ]);
+  const dispose = await plugin.setup(tui.api);
+  activeDisposers.push(dispose);
+  await flushReports();
+
+  const idle = requests.find((request) => requestParam(request, "state") === "idle");
+  expect(requestParam(idle, "completion")).toEqual({ id: "assistant", text: "Done." });
 });
 
 test("V2 aggregates root and child blockers and ignores other roots and child completion", async () => {

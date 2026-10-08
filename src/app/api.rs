@@ -1128,6 +1128,7 @@ impl App {
                     "agent.prompt is handled asynchronously by the app runtime",
                 );
             }
+            Method::AgentTurn(params) => return self.handle_runtime_agent_turn(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,
@@ -1139,6 +1140,9 @@ impl App {
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
             Method::AgentSendKeys(params) => {
                 return self.handle_agent_send_keys(request.id, params);
+            }
+            Method::AgentInterrupt(target) => {
+                return self.handle_runtime_agent_interrupt(request.id, target);
             }
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),

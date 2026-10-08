@@ -1228,6 +1228,21 @@
     },
     "request": {
       "$defs": {
+        "AgentCompletion": {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "text"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1390,6 +1405,33 @@
           },
           "required": [
             "target"
+          ],
+          "type": "object"
+        },
+        "AgentTurnParams": {
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "target",
+            "request_id",
+            "text"
           ],
           "type": "object"
         },
@@ -2898,6 +2940,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "completion": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentCompletion"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "message": {
@@ -5324,6 +5376,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.interrupt",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.rename",
               "type": "string"
             },
@@ -5409,6 +5477,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.turn",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTurnParams"
             }
           },
           "required": [
@@ -6540,8 +6624,33 @@
     },
     "success_response": {
       "$defs": {
+        "AgentCompletion": {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "text"
+          ],
+          "type": "object"
+        },
         "AgentInfo": {
           "properties": {
+            "active_turn": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentTurnInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "agent": {
               "type": [
                 "string",
@@ -6560,6 +6669,17 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "completion": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentCompletion"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The latest unique completion reported for the current agent session."
             },
             "completion_seq": {
               "description": "The current idle transition completed work, independently of who has viewed it.",
@@ -6605,6 +6725,12 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "recent_turns": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AgentTurnInfo"
+              },
+              "type": "array"
             },
             "revision": {
               "format": "uint64",
@@ -6773,6 +6899,70 @@
             "blocked",
             "done",
             "unknown"
+          ],
+          "type": "string"
+        },
+        "AgentTurnInfo": {
+          "description": "The server-owned state of the one turn currently associated with a pane.",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentTurnResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "settled": {
+              "type": "boolean"
+            },
+            "submitted": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "request_id",
+            "submitted",
+            "settled"
+          ],
+          "type": "object"
+        },
+        "AgentTurnResult": {
+          "properties": {
+            "completion_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/AgentTurnStatus"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "status",
+            "text"
+          ],
+          "type": "object"
+        },
+        "AgentTurnStatus": {
+          "enum": [
+            "completed",
+            "interrupted",
+            "timed_out",
+            "failed"
           ],
           "type": "string"
         },
@@ -9494,6 +9684,22 @@
             },
             {
               "properties": {
+                "turn": {
+                  "$ref": "#/schemas/success_response/$defs/AgentTurnResult"
+                },
+                "type": {
+                  "const": "agent_turn",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "turn"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agents": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/AgentInfo"
@@ -10420,6 +10626,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_turn": {
+              "default": false,
+              "description": "Supports typed OpenCode turn submission and completion waiting.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

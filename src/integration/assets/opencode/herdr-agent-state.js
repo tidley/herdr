@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=opencode
-// HERDR_INTEGRATION_VERSION=13
+// HERDR_INTEGRATION_VERSION=14
 
 import net from "node:net";
 
@@ -59,9 +59,17 @@ function request(method, params) {
 }
 
 function requestOnce(method, params) {
+  const reportSocket = process.env.HERDR_PANE_REPORT_SOCKET;
+  const reportToken = process.env.HERDR_PANE_REPORT_TOKEN;
   const paneId = process.env.HERDR_PANE_ID;
   const socketPath = process.env.HERDR_SOCKET_PATH;
 
+  if (reportSocket && reportToken) {
+    const report = { token: reportToken, source: SOURCE, agent: AGENT, seq: nextReportSeq(), ...params };
+    const socketEndpoint =
+      process.platform === "win32" ? `\\\\.\\pipe\\${reportSocket}` : reportSocket;
+    return send(socketEndpoint, report);
+  }
   if (!paneId || !socketPath) {
     return Promise.resolve();
   }
@@ -84,21 +92,20 @@ function requestOnce(method, params) {
     },
   };
 
+  return send(socketEndpoint, request);
+}
+
+function send(socketEndpoint, report) {
   return new Promise((resolve) => {
-    const client = net.createConnection(socketEndpoint, () => {
-      client.write(`${JSON.stringify(request)}\n`);
-    });
-
-    const finish = () => {
-      client.destroy();
-      resolve();
-    };
-
-    client.setTimeout(500, finish);
+    let settled = false;
+    const client = net.createConnection(socketEndpoint, () => client.write(`${JSON.stringify(report)}\n`));
+    const finish = () => { if (!settled) { settled = true; client.destroy(); resolve(); } };
+    const timer = setTimeout(finish, 500);
+    timer.unref?.();
     client.on("data", finish);
     client.on("error", finish);
     client.on("end", finish);
-    client.on("close", resolve);
+    client.on("close", finish);
   });
 }
 
@@ -136,8 +143,8 @@ export const HerdrAgentStatePlugin = async () => {
   if (
     !ownsLocalLifecycle() ||
     process.env.HERDR_ENV !== "1" ||
-    !process.env.HERDR_SOCKET_PATH ||
-    !process.env.HERDR_PANE_ID
+     !(process.env.HERDR_PANE_REPORT_SOCKET && process.env.HERDR_PANE_REPORT_TOKEN) &&
+     (!process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID)
   ) {
     return {};
   }

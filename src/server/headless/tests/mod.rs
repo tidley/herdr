@@ -59,6 +59,133 @@ fn test_headless_server() -> HeadlessServer {
     test_headless_server_with_event_hub(api::EventHub::default())
 }
 
+#[test]
+fn standalone_runtime_adapter_claims_turn_and_interrupt_requests() {
+    let server = test_headless_server();
+    let turn = api::schema::Request {
+        id: "turn".into(),
+        method: api::schema::Method::AgentTurn(api::schema::AgentTurnParams {
+            target: "agent".into(),
+            request_id: "request".into(),
+            text: "prompt".into(),
+            timeout_ms: None,
+            deadline: None,
+        }),
+    };
+    let interrupt = api::schema::Request {
+        id: "interrupt".into(),
+        method: api::schema::Method::AgentInterrupt(api::schema::AgentTarget {
+            target: "agent".into(),
+        }),
+    };
+
+    assert!(server.runtime_adapter.claims(&turn));
+    assert!(server.runtime_adapter.claims(&interrupt));
+}
+
+#[tokio::test]
+async fn standalone_socket_adapter_settles_interrupted_turn_once() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("agent");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    let session = crate::agent_resume::AgentSessionRef::id("session").unwrap();
+    let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+    terminal.set_agent_name("reviewer".into());
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::OpenCode),
+        crate::detect::AgentState::Idle,
+    );
+    terminal.set_hook_authority_at(
+        "herdr:opencode".into(),
+        "opencode".into(),
+        crate::detect::AgentState::Idle,
+        None,
+        Some(session.clone()),
+        Some(1),
+        Instant::now(),
+    );
+    terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+        source: "herdr:opencode".into(),
+        agent: "opencode".into(),
+        session_ref: session,
+    });
+    let (runtime, mut inputs) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+    server.app.state.insert_test_runtime(pane_id, runtime);
+
+    let (turn_tx, turn_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "turn".into(),
+            method: api::schema::Method::AgentTurn(api::schema::AgentTurnParams {
+                target: "reviewer".into(),
+                request_id: "request".into(),
+                text: "prompt".into(),
+                timeout_ms: None,
+                deadline: None,
+            }),
+        },
+        respond_to: turn_tx,
+        response_write_complete: None,
+    });
+    assert!(serde_json::from_str::<api::schema::SuccessResponse>(&turn_rx.recv().unwrap()).is_ok());
+    assert_eq!(inputs.recv().await.unwrap(), Bytes::from_static(b"prompt"));
+    assert_eq!(inputs.recv().await.unwrap(), Bytes::from_static(b"\r"));
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .set_detected_state(
+            Some(crate::detect::Agent::OpenCode),
+            crate::detect::AgentState::Working,
+        );
+
+    let (interrupt_tx, interrupt_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "interrupt".into(),
+            method: api::schema::Method::AgentInterrupt(api::schema::AgentTarget {
+                target: "reviewer".into(),
+            }),
+        },
+        respond_to: interrupt_tx,
+        response_write_complete: None,
+    });
+    assert!(
+        serde_json::from_str::<api::schema::SuccessResponse>(&interrupt_rx.recv().unwrap()).is_ok()
+    );
+    assert_eq!(inputs.recv().await.unwrap(), Bytes::from_static(b"\x03"));
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .set_detected_state(
+            Some(crate::detect::Agent::OpenCode),
+            crate::detect::AgentState::Idle,
+        );
+    let standalone = server
+        .app
+        .embedded_agent_turn_result(&terminal_id, "request")
+        .unwrap();
+
+    assert_eq!(
+        standalone.status,
+        crate::api::schema::AgentTurnStatus::Interrupted
+    );
+    assert_eq!(
+        server
+            .app
+            .embedded_agent_turn_result(&terminal_id, "request"),
+        Some(standalone)
+    );
+}
+
 fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServer {
     let config = crate::config::Config::default();
     let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -100,6 +227,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
 
     HeadlessServer {
         app,
+        runtime_adapter: crate::runtime::StandaloneRuntimeAdapter,
         #[cfg(unix)]
         api_tx: None,
         api_server: None,
@@ -5700,6 +5828,7 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
             agent_label: "pi".into(),
             state: crate::detect::AgentState::Working,
             message: None,
+            completion: None,
             seq: None,
             session_ref: None,
         })
@@ -7422,6 +7551,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
             agent: "prime-agent".into(),
             state: api::schema::PaneAgentState::Idle,
             message: None,
+            completion: None,
             seq: Some(1),
             agent_session_id: Some("01a0".into()),
             agent_session_path: None,
@@ -7598,6 +7728,7 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
                 agent: "pi".into(),
                 state,
                 message: None,
+                completion: None,
                 seq: Some(seq as u64 + 1),
                 agent_session_id: None,
                 agent_session_path: None,
@@ -7675,6 +7806,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 agent: "pi".into(),
                 state: PaneAgentState::Idle,
                 message: None,
+                completion: None,
                 seq: Some(12),
                 agent_session_id: None,
                 agent_session_path: Some(new_session.clone()),
@@ -7866,6 +7998,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                 agent: "pi".into(),
                 state: api::schema::PaneAgentState::Idle,
                 message: None,
+                completion: None,
                 seq: Some(19),
                 agent_session_id: None,
                 agent_session_path: None,

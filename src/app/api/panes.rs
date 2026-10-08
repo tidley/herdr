@@ -1581,10 +1581,17 @@ impl App {
             agent_label: agent_label.clone(),
             state: detect_state_from_api(params.state),
             message: params.message,
+            completion: None,
             seq: params.seq,
         });
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        if applied {
+            if let (Some(session_ref), Some(completion)) = (session_ref.as_ref(), params.completion)
+            {
+                self.record_agent_completion(ws_idx, pane_id, session_ref, completion);
+            }
+        }
         self.report_agent_resume(
             id,
             ws_idx,
@@ -1663,6 +1670,28 @@ impl App {
     ) -> Option<&crate::terminal::TerminalState> {
         let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
         self.state.terminals.get(&pane.attached_terminal_id)
+    }
+
+    fn record_agent_completion(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        completion: crate::api::schema::AgentCompletion,
+    ) {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.reconcile_agent_turn();
+            terminal.record_agent_completion(session_ref, completion);
+        }
     }
 
     fn report_agent_resume(
@@ -3059,6 +3088,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pane_report_agent_keeps_the_latest_unique_session_completion() {
+        let mut app = app_with_linked_worktree();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::OpenCode),
+                crate::detect::AgentState::Working,
+            );
+        let selection: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+            "id": "session",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": public_pane_id,
+                "source": "herdr:opencode",
+                "agent": "opencode",
+                "seq": 0,
+                "agent_session_id": "session-1",
+                "session_start_source": "select"
+            }
+        }))
+        .unwrap();
+        app.handle_api_request(selection);
+
+        for (seq, completion) in [
+            (
+                1,
+                serde_json::json!({ "id": "message-1", "text": "First answer" }),
+            ),
+            (
+                2,
+                serde_json::json!({ "id": "message-1", "text": "Changed repeat" }),
+            ),
+            (
+                3,
+                serde_json::json!({ "id": "message-2", "text": "Second answer" }),
+            ),
+        ] {
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": format!("report-{seq}"),
+                "method": "pane.report_agent",
+                "params": {
+                    "pane_id": public_pane_id,
+                    "source": "herdr:opencode",
+                    "agent": "opencode",
+                    "state": "idle",
+                    "seq": seq,
+                    "agent_session_id": "session-1",
+                    "completion": completion,
+                }
+            }))
+            .unwrap();
+            let response = app.handle_api_request(request);
+            let response: crate::api::schema::SuccessResponse =
+                serde_json::from_str(&response).unwrap();
+            assert_eq!(response.id, format!("report-{seq}"));
+        }
+
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .hook_authority
+                .as_ref()
+                .map(|authority| authority.source.as_str()),
+            Some("herdr:opencode")
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .last_agent_completion
+                .as_ref()
+                .map(|completion| completion.id.as_str()),
+            Some("message-2")
+        );
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "agent".into(),
+            method: crate::api::schema::Method::AgentGet(crate::api::schema::AgentTarget {
+                target: public_pane_id,
+            }),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["agent"]["completion"]["id"], "message-2");
+        assert_eq!(
+            value["result"]["agent"]["completion"]["text"],
+            "Second answer"
+        );
     }
 
     #[test]

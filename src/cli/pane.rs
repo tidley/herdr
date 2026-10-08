@@ -1280,6 +1280,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         agent,
         state,
         message,
+        completion: None,
         seq,
         agent_session_id,
         agent_session_path,

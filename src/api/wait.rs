@@ -4,8 +4,8 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, EventData, EventEnvelope, EventKind, EventMatch, EventsWaitParams,
-    Method, Request, ResponseResult, Subscription, SubscriptionEventData,
+    AgentTurnResult, ErrorBody, ErrorResponse, EventData, EventEnvelope, EventKind, EventMatch,
+    EventsWaitParams, Method, Request, ResponseResult, Subscription, SubscriptionEventData,
     SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
@@ -18,6 +18,101 @@ use crate::api::{ApiRequestSender, EventHub};
 use crate::ipc::LocalStream;
 
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
+
+pub(super) fn turn_agent(
+    socket_request_id: String,
+    mut params: crate::api::schema::AgentTurnParams,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    params.deadline = params
+        .timeout_ms
+        .map(|timeout_ms| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+    let response = dispatch_to_app_with_caller_timeout(
+        Request {
+            id: socket_request_id.clone(),
+            method: Method::AgentTurn(params.clone()),
+        },
+        api_tx,
+        params
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now())),
+    );
+    let agent = match agent_from_response(&socket_request_id, &response) {
+        Ok(agent) => agent,
+        Err(_) => return Ok(Some(response)),
+    };
+    loop {
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
+        match agent_get(&socket_request_id, &params.target, api_tx) {
+            Ok(current) => {
+                if current.terminal_id != agent.terminal_id {
+                    return Ok(Some(error_response(
+                        &socket_request_id,
+                        "agent_turn_failed",
+                        "agent turn lost its terminal",
+                    )?));
+                }
+                if let Some(turn) = current
+                    .active_turn
+                    .into_iter()
+                    .chain(current.recent_turns)
+                    .find(|turn| turn.request_id == params.request_id)
+                {
+                    if let Some(result) = turn.result {
+                        return turn_response(socket_request_id, result).map(Some);
+                    }
+                } else {
+                    return Ok(Some(error_response(
+                        &socket_request_id,
+                        "agent_turn_failed",
+                        "agent turn disappeared",
+                    )?));
+                }
+            }
+            Err(error) if error.error.code == "agent_not_found" => {
+                return turn_response(
+                    socket_request_id,
+                    AgentTurnResult {
+                        request_id: params.request_id.clone(),
+                        completion_id: None,
+                        status: crate::api::schema::AgentTurnStatus::Failed,
+                        text: String::new(),
+                    },
+                )
+                .map(Some);
+            }
+            Err(error) => {
+                return serde_json::to_string(&error)
+                    .map(Some)
+                    .map_err(std::io::Error::other)
+            }
+        }
+        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
+}
+
+fn turn_response(request_id: String, turn: AgentTurnResult) -> std::io::Result<String> {
+    serde_json::to_string(&SuccessResponse {
+        id: request_id,
+        result: ResponseResult::AgentTurn { turn },
+    })
+    .map_err(std::io::Error::other)
+}
+
+fn error_response(request_id: &str, code: &str, message: &str) -> std::io::Result<String> {
+    serde_json::to_string(&ErrorResponse {
+        id: request_id.into(),
+        error: ErrorBody {
+            code: code.into(),
+            message: message.into(),
+        },
+    })
+    .map_err(std::io::Error::other)
+}
 
 pub(super) fn wait_for_output(
     request_id: String,

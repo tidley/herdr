@@ -186,6 +186,9 @@ enum AltScreenReadConflict {
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
+    // This borrows the standalone App for turn requests only. It does not own
+    // the server's socket, clients, rendering, or UI state.
+    runtime_adapter: crate::runtime::StandaloneRuntimeAdapter,
     #[cfg(unix)]
     api_tx: Option<api::ApiRequestSender>,
     // Kept on every platform so dropping HeadlessServer owns API server shutdown.
@@ -339,6 +342,7 @@ impl HeadlessServer {
         let _ = api_tx;
         Ok(Self {
             app,
+            runtime_adapter: crate::runtime::StandaloneRuntimeAdapter,
             #[cfg(unix)]
             api_tx,
             api_server,
@@ -2925,6 +2929,15 @@ impl HeadlessServer {
                 api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
             );
         changed |= self.drain_all_internal_events_with_forwarding();
+
+        if self.runtime_adapter.claims(&msg.request) {
+            let response = self
+                .runtime_adapter
+                .dispatch(&mut self.app, msg.request)
+                .expect("claimed runtime request has a response");
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
 
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like

@@ -75,6 +75,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        agent_turn: true,
     })
 }
 
@@ -469,6 +470,30 @@ fn handle_connection_with_stop(
             )?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
+        Method::AgentTurn(params) => {
+            let response = crate::api::wait::turn_agent(
+                request_id.clone(),
+                params,
+                &mut stream,
+                api_tx,
+                running,
+            )?;
+            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+        }
+        Method::AgentInterrupt(target) => {
+            let response = handle_request(
+                Request {
+                    id: request_id.clone(),
+                    method: Method::AgentInterrupt(target),
+                },
+                api_tx,
+                capabilities,
+                server_stop,
+                None,
+                None,
+            );
+            finish_wait_response(&mut stream, Some(response), &request_id, method, changes_ui)
+        }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
                 request_id.clone(),
@@ -643,12 +668,14 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentRead(_) => "agent.read",
         Method::AgentExplain(_) => "agent.explain",
         Method::AgentSendKeys(_) => "agent.send_keys",
+        Method::AgentInterrupt(_) => "agent.interrupt",
         Method::AgentRename(_) => "agent.rename",
         Method::AgentViewSet(_) => "agent.view.set",
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentTurn(_) => "agent.turn",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -1500,6 +1527,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_turn: true,
             }),
             None,
             None,

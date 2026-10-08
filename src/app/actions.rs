@@ -1494,12 +1494,27 @@ impl AppState {
                 agent_label,
                 state,
                 message,
+                completion,
                 seq,
                 session_ref,
             } => {
-                if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
+                let report_is_newer = self
+                    .workspaces
+                    .iter()
+                    .find_map(|workspace| workspace.pane_state(pane_id))
+                    .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+                    .is_some_and(|terminal| terminal.hook_report_is_newer(&source, seq));
+                let updates = if crate::agent_resume::is_reserved_native_state_source(
+                    &source,
+                    &agent_label,
+                ) {
                     self.update_terminal_state(pane_id, |terminal| {
-                        terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
+                        terminal.set_agent_session_ref(
+                            source,
+                            agent_label,
+                            session_ref.clone(),
+                            seq,
+                        )
                     })
                     .into_iter()
                     .collect()
@@ -1510,13 +1525,23 @@ impl AppState {
                             agent_label,
                             state,
                             message,
-                            session_ref,
+                            session_ref.clone(),
                             seq,
                         )
                     })
                     .into_iter()
                     .collect()
+                };
+                if report_is_newer {
+                    if let (Some(session_ref), Some(completion)) = (session_ref, completion) {
+                        self.update_terminal_state(pane_id, |terminal| {
+                            terminal.reconcile_agent_turn();
+                            terminal.record_agent_completion(&session_ref, completion);
+                            None
+                        });
+                    }
                 }
+                updates
             }
             AppEvent::AgentResumeReported {
                 pane_id,
@@ -1711,6 +1736,7 @@ impl AppState {
             let had_completion = terminal.last_agent_completion_seq.is_some() || !previous_seen;
             let resume_revision = terminal.reported_resume_revision();
             let mutation = update(terminal);
+            terminal.reconcile_agent_turn();
             terminal.reconcile_reported_resume();
             // Resume-only changes return no mutation but must still be saved.
             if terminal.reported_resume_revision() != resume_revision {
@@ -3285,6 +3311,7 @@ mod tests {
                 agent_label: label.into(),
                 state,
                 message: None,
+                completion: None,
                 seq: Some(seq),
                 session_ref: None,
             });
@@ -3651,6 +3678,7 @@ mod tests {
             agent_label: "prime-agent".into(),
             state: AgentState::Idle,
             message: None,
+            completion: None,
             seq: Some(1),
             session_ref: None,
         });
@@ -3700,6 +3728,7 @@ mod tests {
                 agent_label: "codex".into(),
                 state: AgentState::Working,
                 message: None,
+                completion: None,
                 seq: Some(seq + 1),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
             });
@@ -3709,6 +3738,7 @@ mod tests {
                 agent_label: "codex".into(),
                 state: AgentState::Idle,
                 message: None,
+                completion: None,
                 seq: Some(seq + 2),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
             });
@@ -3726,6 +3756,7 @@ mod tests {
             agent_label: "codex".into(),
             state: AgentState::Working,
             message: None,
+            completion: None,
             seq: Some(7),
             session_ref: crate::agent_resume::AgentSessionRef::id("second"),
         });
@@ -3735,6 +3766,7 @@ mod tests {
             agent_label: "codex".into(),
             state: AgentState::Idle,
             message: None,
+            completion: None,
             seq: Some(8),
             session_ref: crate::agent_resume::AgentSessionRef::id("first"),
         });
@@ -3789,6 +3821,7 @@ mod tests {
             agent_label: "other".into(),
             state: AgentState::Working,
             message: None,
+            completion: None,
             seq: None,
             session_ref: None,
         });
@@ -3892,6 +3925,7 @@ mod tests {
             agent_label: "pi".into(),
             state: AgentState::Working,
             message: None,
+            completion: None,
             seq: Some(1),
             session_ref: None,
         });
@@ -3921,6 +3955,7 @@ mod tests {
             agent_label: "hermes".into(),
             state: AgentState::Blocked,
             message: None,
+            completion: None,
             seq: None,
             session_ref: None,
         });
@@ -3959,6 +3994,7 @@ mod tests {
             agent_label: "codex".into(),
             state: AgentState::Working,
             message: None,
+            completion: None,
             seq: Some(1),
             session_ref: None,
         });
@@ -4007,6 +4043,7 @@ mod tests {
             agent_label: "claude".into(),
             state: AgentState::Blocked,
             message: None,
+            completion: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session"),
         });
@@ -4116,6 +4153,7 @@ mod tests {
             agent_label: "devin".into(),
             state: AgentState::Working,
             message: None,
+            completion: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("devin-session"),
         });
@@ -4140,6 +4178,7 @@ mod tests {
             agent_label: "pi".into(),
             state: AgentState::Working,
             message: None,
+            completion: None,
             seq: Some(20),
             session_ref: crate::agent_resume::AgentSessionRef::path(first_session),
         });
@@ -4152,6 +4191,7 @@ mod tests {
             agent_label: "pi".into(),
             state: AgentState::Working,
             message: None,
+            completion: None,
             seq: Some(21),
             session_ref: crate::agent_resume::AgentSessionRef::path(second_session),
         });

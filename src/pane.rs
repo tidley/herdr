@@ -1747,9 +1747,9 @@ fn shutdown_pane_processes(
     pane_id: PaneId,
     child_pid: u32,
     child_wait_completed: Option<&AtomicBool>,
-) {
+) -> bool {
     if child_pid == 0 {
-        return;
+        return true;
     }
 
     let mut pids = crate::platform::session_processes(child_pid);
@@ -1781,7 +1781,7 @@ fn shutdown_pane_processes(
                 ?signal,
                 "pane session terminated"
             );
-            return;
+            return true;
         }
     }
 
@@ -1791,6 +1791,7 @@ fn shutdown_pane_processes(
         pids = ?pids,
         "pane session still alive after forced shutdown"
     );
+    false
 }
 
 #[cfg(unix)]
@@ -2218,17 +2219,28 @@ fn publish_reported_cwd(
 
 impl PaneRuntime {
     pub fn shutdown(mut self) {
+        let _ = self.shutdown_checked();
+    }
+
+    pub fn shutdown_checked(&mut self) -> std::io::Result<()> {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
         self.compression.abort();
         self.io.shutdown();
-        shutdown_pane_processes(
+        let terminated = shutdown_pane_processes(
             self.pane_id,
             self.child_pid.load(Ordering::Acquire),
             self.child_wait_completed.as_deref(),
         );
         self.preserve_processes_on_drop = true;
+        if terminated {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "pane child process remained alive after shutdown",
+            ))
+        }
     }
 
     #[cfg(unix)]

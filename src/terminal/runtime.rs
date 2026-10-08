@@ -21,6 +21,10 @@ impl TerminalRuntime {
         self.0.shutdown();
     }
 
+    pub fn shutdown_checked(&mut self) -> std::io::Result<()> {
+        self.0.shutdown_checked()
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.0.duplicate_handoff_fd()

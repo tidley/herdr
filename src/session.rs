@@ -222,7 +222,12 @@ pub fn session_info(name: Option<&str>) -> SessionInfo {
     let running = connection.is_ok();
     let connection_error = connection
         .err()
-        .filter(|error| !crate::cli::server_not_running_error(error))
+        .filter(|error| {
+            !matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        })
         .map(|error| error.to_string());
     SessionInfo {
         name: display_name,

@@ -1,7 +1,7 @@
 // installed by herdr
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // HERDR_INTEGRATION_ID=opencode-tui
-// HERDR_INTEGRATION_VERSION=13
+// HERDR_INTEGRATION_VERSION=14
 
 import net from "node:net";
 
@@ -10,16 +10,26 @@ const AGENT = "opencode";
 const ROUTE_POLL_INTERVAL_MS = 100;
 const SELECTION_RETRY_DELAYS_MS = [100, 400, 1_000];
 
-function requestOnce(sessionID, state, seq, isCurrent = () => true) {
+function requestOnce(sessionID, state, seq, isCurrent = () => true, completion) {
+  const reportSocket = process.env.HERDR_PANE_REPORT_SOCKET;
+  const reportToken = process.env.HERDR_PANE_REPORT_TOKEN;
   const paneId = process.env.HERDR_PANE_ID;
   const socketPath = process.env.HERDR_SOCKET_PATH;
-  if (!paneId || !socketPath) {
+  if (!reportSocket && (!paneId || !socketPath)) {
     return Promise.resolve(true);
   }
 
-  const socketEndpoint =
-    process.platform === "win32" ? `\\\\.\\pipe\\${socketPath}` : socketPath;
-  const request = {
+  const reportEndpoint = reportSocket || socketPath;
+  const socketEndpoint = process.platform === "win32" && reportEndpoint
+    ? `\\\\.\\pipe\\${reportEndpoint}`
+    : reportEndpoint;
+  const request = reportSocket ? {
+    token: reportToken,
+    source: SOURCE,
+    agent: AGENT,
+    agent_session_id: sessionID,
+    ...(state === undefined ? { session_start_source: "select" } : { state, seq, ...(completion && { completion }) }),
+  } : {
     id: `${SOURCE}:tui:${Date.now()}:${Math.floor(Math.random() * 1_000_000)
       .toString()
       .padStart(6, "0")}`,
@@ -29,7 +39,7 @@ function requestOnce(sessionID, state, seq, isCurrent = () => true) {
       source: SOURCE,
       agent: AGENT,
       agent_session_id: sessionID,
-      ...(state === undefined ? { session_start_source: "select" } : { state, seq }),
+      ...(state === undefined ? { session_start_source: "select" } : { state, seq, ...(completion && { completion }) }),
     },
   };
 
@@ -71,7 +81,9 @@ export default {
 };
 
 async function tui(api) {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;
+  if (process.env.HERDR_ENV !== "1" ||
+    (!(process.env.HERDR_PANE_REPORT_SOCKET && process.env.HERDR_PANE_REPORT_TOKEN) &&
+      (!process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID))) return;
 
   let disposed = false;
   let context;
@@ -94,6 +106,16 @@ async function tui(api) {
     });
     if (!current(ctx) || result?.data === undefined) throw new Error("session data unavailable");
     return result.data;
+  }
+
+  async function latestCompletion(ctx, sessionID) {
+    const messages = await read(ctx, (options) => api.client.session.messages({ sessionID }, options));
+    const message = [...messages].reverse().find((message) => message?.role === "assistant");
+    const text = message?.parts
+      ?.filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("");
+    return typeof message?.id === "string" && text ? { id: message.id, text } : undefined;
   }
 
   // The first selected session owns this pane's subtree. Browsing descendants
@@ -172,7 +194,12 @@ async function tui(api) {
       }
       const value = state(ctx);
       if (value === undefined || value === ctx.lastState) return;
-      const delivered = await requestOnce(selected, value, ++sequence, isCurrent);
+      let completion;
+      if (value === "idle") {
+        try { completion = await latestCompletion(ctx, selected); } catch {}
+        if (!isCurrent()) return;
+      }
+      const delivered = await requestOnce(selected, value, ++sequence, isCurrent, completion);
       if (!isCurrent()) return;
       ctx.lastState = delivered ? value : undefined;
       if (!delivered) ctx.retryAt = Date.now() + 500;
@@ -404,7 +431,9 @@ async function tui(api) {
 }
 
 function setup(api) {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;
+  if (process.env.HERDR_ENV !== "1" ||
+    (!(process.env.HERDR_PANE_REPORT_SOCKET && process.env.HERDR_PANE_REPORT_TOKEN) &&
+      (!process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID))) return;
 
   let disposed = false;
   let selected;
@@ -445,7 +474,19 @@ function setup(api) {
     const isCurrent = () => !disposed && revision === generation && !!sessionID && current() === sessionID;
     chain = chain.then(async () => {
       if (!isCurrent()) return;
-      const delivered = await requestOnce(sessionID, value, value === undefined ? undefined : ++sequence, isCurrent);
+      let completion;
+      if (value === "idle") {
+        const messages = api.data.session.message.list(sessionID);
+        const message = Array.isArray(messages)
+          ? [...messages].reverse().find((message) => message?.type === "assistant")
+          : undefined;
+        if (typeof message?.id === "string" && typeof message.content === "string" && message.content) {
+          completion = { id: message.id, text: message.content };
+        }
+      }
+      const delivered = await requestOnce(
+        sessionID, value, value === undefined ? undefined : ++sequence, isCurrent, completion,
+      );
       if (!delivered) scheduleStateRetry();
     }).catch(() => {});
   }

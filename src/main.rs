@@ -49,6 +49,8 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod render_signal;
+#[allow(dead_code, unused_imports)]
+mod runtime;
 mod selection;
 mod server;
 mod session;
