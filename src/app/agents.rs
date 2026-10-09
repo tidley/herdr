@@ -48,7 +48,11 @@ impl App {
                 "embedded terminal is unavailable",
             )
         })?;
-        let shell_name = available_shell_name(runtime).ok_or_else(|| {
+        let shell_name = wait_for_available_shell(
+            || available_shell_name(runtime),
+            Duration::from_secs(1),
+        )
+        .ok_or_else(|| {
             std::io::Error::other("embedded terminal is not an interactive shell")
         })?;
         let mut argv =
@@ -492,6 +496,22 @@ fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<St
     crate::platform::available_pane_shell(runtime.child_pid()?)
 }
 
+fn wait_for_available_shell(
+    mut lookup: impl FnMut() -> Option<String>,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(shell) = lookup() {
+            return Some(shell);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 pub(super) fn runtime_hosts_agent(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
@@ -542,7 +562,25 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_agent_name;
+    use std::time::Duration;
+
+    use super::{valid_agent_name, wait_for_available_shell};
+
+    #[test]
+    fn waits_for_a_new_pane_shell_to_enter_the_foreground() {
+        let mut attempts = 0;
+
+        let shell = wait_for_available_shell(
+            || {
+                attempts += 1;
+                (attempts == 2).then_some("sh".to_string())
+            },
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(shell.as_deref(), Some("sh"));
+        assert_eq!(attempts, 2);
+    }
 
     #[test]
     fn agent_names_use_a_small_cli_safe_grammar() {
