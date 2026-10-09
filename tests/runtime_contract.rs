@@ -22,6 +22,7 @@ fn config() -> RuntimeConfig {
 fn execution() -> TargetExecutionConfig {
     TargetExecutionConfig {
         working_directory: PathBuf::from("/tmp/herdr-runtime-contract-work"),
+        executable: PathBuf::from("opencode"),
         agent: "agent".into(),
         model: "provider/model".into(),
         session: SessionSelection::New,
