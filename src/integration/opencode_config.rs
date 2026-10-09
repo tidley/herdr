@@ -42,10 +42,18 @@ fn validate_plugin_config(config_path: &Path, key: &str) -> io::Result<()> {
 }
 
 pub(crate) fn add_tui_plugin(config_dir: &Path, plugin_spec: &str) -> io::Result<PathBuf> {
+    let mut configured_path = None;
     for path in tui_config_paths(config_dir) {
-        if plugin_is_configured(&path, "plugin", plugin_spec) {
-            return Ok(path);
+        if !path.is_file() {
+            continue;
         }
+        if !plugin_is_configured(&path, "plugin", plugin_spec) {
+            add_plugin(path.clone(), "plugin", plugin_spec)?;
+        }
+        configured_path.get_or_insert(path);
+    }
+    if let Some(path) = configured_path {
+        return Ok(path);
     }
     // Keep tui.json absent on fresh installs so OpenCode can migrate its settings.
     add_plugin(config_dir.join(TUI_CONFIG_NAME), "plugin", plugin_spec)

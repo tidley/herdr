@@ -2472,6 +2472,31 @@ fn opencode_install_defers_v2_registration_while_migration_pending() {
 }
 
 #[test]
+fn opencode_install_registers_v1_plugin_in_existing_tui_json() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let opencode_dir = home.join(".config/opencode");
+    fs::create_dir_all(&opencode_dir).unwrap();
+    fs::write(opencode_dir.join("tui.json"), r#"{"mouse":false}"#).unwrap();
+    fs::write(
+        opencode_dir.join("tui.jsonc"),
+        r#"{"plugin":["./herdr-tui-session.js"]}"#,
+    )
+    .unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_opencode().unwrap();
+
+    let tui_config: Value =
+        serde_json::from_str(&fs::read_to_string(opencode_dir.join("tui.json")).unwrap()).unwrap();
+    assert_eq!(tui_config["plugin"], json!([OPENCODE_TUI_PLUGIN_SPEC]));
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 fn opencode_v2_install_status_and_uninstall_preserve_cli_preferences() {
     let _lock = integration_env_lock();
     let base = unique_base();
