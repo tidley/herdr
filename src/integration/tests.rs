@@ -2344,6 +2344,47 @@ fn install_opencode_writes_server_and_tui_plugins() {
     let _ = fs::remove_dir_all(base);
 }
 
+#[test]
+fn install_opencode_replaces_every_stale_versioned_asset() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let opencode_dir = home.join(".config/opencode");
+    let plugins_dir = opencode_dir.join("plugins");
+    let v2_dir = opencode_dir.join(OPENCODE_V2_TUI_PLUGIN_DIR);
+    fs::create_dir_all(&plugins_dir).unwrap();
+    fs::create_dir_all(&v2_dir).unwrap();
+    fs::write(
+        plugins_dir.join(OPENCODE_PLUGIN_INSTALL_NAME),
+        "// HERDR_INTEGRATION_VERSION=14\n",
+    )
+    .unwrap();
+    fs::write(
+        opencode_dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME),
+        "// HERDR_INTEGRATION_VERSION=14\n",
+    )
+    .unwrap();
+    fs::write(v2_dir.join("tui.js"), "// HERDR_INTEGRATION_VERSION=14\n").unwrap();
+    std::env::set_var("HOME", &home);
+
+    let installed = install_opencode().unwrap();
+
+    assert_eq!(
+        fs::read_to_string(installed.plugin_path).unwrap(),
+        OPENCODE_PLUGIN_ASSET
+    );
+    assert_eq!(
+        fs::read_to_string(installed.tui_plugin_path).unwrap(),
+        OPENCODE_TUI_PLUGIN_ASSET
+    );
+    assert_eq!(
+        fs::read_to_string(v2_dir.join("tui.js")).unwrap(),
+        OPENCODE_V2_TUI_PLUGIN_ASSET
+    );
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
 #[cfg(unix)]
 #[test]
 fn opencode_reuses_json_registration_in_symlinked_config_directory() {

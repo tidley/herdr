@@ -311,6 +311,153 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_socket_report_forwards_startup_session_source() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let state_path = std::env::temp_dir().join(format!(
+            "herdr-embedded-report-session-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (listener, environment, pane) =
+            PaneReportListener::start(event_tx, &state_path).unwrap();
+        let token = environment[1].1.clone();
+        let pane_id = crate::layout::PaneId::alloc();
+        *pane.lock().unwrap() = Some(pane_id);
+
+        let mut stream = crate::ipc::connect_local_stream(&listener.path).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "token": token,
+                "source": "herdr:opencode",
+                "agent": "opencode",
+                "agent_session_id": "session",
+                "session_start_source": "startup"
+            })
+        )
+        .unwrap();
+
+        assert!(matches!(
+            event_rx.blocking_recv(),
+            Some(AppEvent::AgentSessionReported {
+                pane_id: reported_pane,
+                session_start_source: Some(source),
+                ..
+            }) if reported_pane == pane_id && source == "startup"
+        ));
+        let mut acknowledgement = Vec::new();
+        stream.read_to_end(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, b"{}\n");
+        drop(listener);
+        let _ = std::fs::remove_dir(&state_path);
+    }
+
+    #[test]
+    fn socket_report_rejects_wrong_token() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let state_path = std::env::temp_dir().join(format!(
+            "herdr-embedded-report-token-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (listener, _, pane) = PaneReportListener::start(event_tx, &state_path).unwrap();
+        *pane.lock().unwrap() = Some(crate::layout::PaneId::alloc());
+
+        let mut stream = crate::ipc::connect_local_stream(&listener.path).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "token": "wrong",
+                "source": "herdr:opencode",
+                "agent": "opencode",
+                "agent_session_id": "session"
+            })
+        )
+        .unwrap();
+        drop(stream);
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(event_rx.try_recv().is_err());
+        drop(listener);
+        let _ = std::fs::remove_dir(&state_path);
+    }
+
+    #[test]
+    fn socket_report_rejects_malformed_payload() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let state_path = std::env::temp_dir().join(format!(
+            "herdr-embedded-report-malformed-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (listener, _, pane) = PaneReportListener::start(event_tx, &state_path).unwrap();
+        *pane.lock().unwrap() = Some(crate::layout::PaneId::alloc());
+
+        let mut stream = crate::ipc::connect_local_stream(&listener.path).unwrap();
+        writeln!(stream, "not json").unwrap();
+        drop(stream);
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(event_rx.try_recv().is_err());
+        drop(listener);
+        let _ = std::fs::remove_dir(&state_path);
+    }
+
+    #[test]
+    fn timed_out_socket_report_does_not_block_a_later_report() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let state_path = std::env::temp_dir().join(format!(
+            "herdr-embedded-report-timeout-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (listener, environment, pane) =
+            PaneReportListener::start(event_tx, &state_path).unwrap();
+        let path = listener.path.clone();
+        let token = environment[1].1.clone();
+        let pane_id = crate::layout::PaneId::alloc();
+        *pane.lock().unwrap() = Some(pane_id);
+        let stalled = crate::ipc::connect_local_stream(&path).unwrap();
+
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(REPORT_DEADLINE + Duration::from_millis(50));
+            let mut stream = crate::ipc::connect_local_stream(&path).unwrap();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "token": token,
+                    "source": "herdr:opencode",
+                    "agent": "opencode",
+                    "state": "idle"
+                })
+            )
+            .unwrap();
+        });
+
+        assert!(matches!(
+            event_rx.blocking_recv(),
+            Some(AppEvent::HookStateReported { pane_id: reported_pane, .. }) if reported_pane == pane_id
+        ));
+        drop(stalled);
+        sender.join().unwrap();
+        drop(listener);
+        let _ = std::fs::remove_dir(&state_path);
+    }
+
+    #[test]
     fn full_event_channel_does_not_acknowledge_a_report() {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
         let state_path =
