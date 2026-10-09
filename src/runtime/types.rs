@@ -47,6 +47,8 @@ pub enum SessionSelection {
 pub struct TargetExecutionConfig {
     /// Directory in which the target's terminal and OpenCode process start.
     pub working_directory: PathBuf,
+    /// Executable used to start OpenCode for this target.
+    pub executable: PathBuf,
     /// OpenCode agent passed with `--agent`.
     pub agent: String,
     /// OpenCode model passed with `--model`.

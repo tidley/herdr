@@ -660,6 +660,7 @@ mod tests {
     fn execution() -> TargetExecutionConfig {
         TargetExecutionConfig {
             working_directory: "/work".into(),
+            executable: "opencode".into(),
             agent: "agent".into(),
             model: "model".into(),
             session: SessionSelection::New,
@@ -752,6 +753,7 @@ mod tests {
                             LogicalTarget::conversation("conversation").unwrap(),
                             TargetExecutionConfig {
                                 working_directory: "/work".into(),
+                                executable: "opencode".into(),
                                 agent: "agent".into(),
                                 model: "model".into(),
                                 session: SessionSelection::New,
@@ -778,6 +780,7 @@ mod tests {
                     LogicalTarget::conversation("conversation").unwrap(),
                     TargetExecutionConfig {
                         working_directory: "/work".into(),
+                        executable: "opencode".into(),
                         agent: "agent".into(),
                         model: "model".into(),
                         session: SessionSelection::New,
@@ -796,12 +799,14 @@ mod tests {
         let target = LogicalTarget::conversation("conversation").unwrap();
         let initial = TargetExecutionConfig {
             working_directory: "/work/initial".into(),
+            executable: "opencode".into(),
             agent: "initial-agent".into(),
             model: "initial-model".into(),
             session: SessionSelection::New,
         };
         let changed = TargetExecutionConfig {
             working_directory: "/work/changed".into(),
+            executable: "opencode".into(),
             agent: "changed-agent".into(),
             model: "changed-model".into(),
             session: SessionSelection::Resume("previous".into()),
@@ -957,6 +962,7 @@ mod tests {
             .clone();
         let changed_execution = TargetExecutionConfig {
             working_directory: "/work/changed".into(),
+            executable: "opencode".into(),
             agent: "changed-agent".into(),
             model: "changed-model".into(),
             session: SessionSelection::Resume("previous".into()),
@@ -987,6 +993,7 @@ mod tests {
                     target,
                     TargetExecutionConfig {
                         working_directory: "/work/another-change".into(),
+                        executable: "opencode".into(),
                         agent: "another-agent".into(),
                         model: "another-model".into(),
                         session: SessionSelection::New,

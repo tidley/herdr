@@ -20,7 +20,7 @@ pub(crate) struct EmbeddedApp {
     state_path: PathBuf,
     data_path: PathBuf,
     #[cfg(test)]
-    test_terminal_factory: Option<Box<dyn FnMut(&mut App, PathBuf) -> std::io::Result<TerminalId>>>,
+    test_terminal_factory: Option<Box<dyn FnMut(&mut App, PathBuf, Vec<(String, String)>) -> std::io::Result<TerminalId>>>,
     #[cfg(test)]
     shutdown_error: Option<std::io::Error>,
 }
@@ -68,7 +68,7 @@ impl EmbeddedApp {
 
     #[cfg(test)]
     fn new_for_test(
-        factory: impl FnMut(&mut App, PathBuf) -> std::io::Result<TerminalId> + 'static,
+        factory: impl FnMut(&mut App, PathBuf, Vec<(String, String)>) -> std::io::Result<TerminalId> + 'static,
     ) -> Self {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -90,7 +90,7 @@ impl EmbeddedApp {
 
     #[cfg(test)]
     pub(crate) fn ready_for_test() -> Self {
-        Self::new_for_test(|app, _| {
+        Self::new_for_test(|app, _, _| {
             let workspace = crate::workspace::Workspace::test_new("embedded");
             let pane_id = workspace.tabs[0].root_pane;
             let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
@@ -119,7 +119,7 @@ impl EmbeddedApp {
     ) {
         let inputs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let factory_inputs = inputs.clone();
-        let app = Self::new_for_test(move |app, _| {
+        let app = Self::new_for_test(move |app, _, _| {
             let workspace = crate::workspace::Workspace::test_new("embedded");
             let pane_id = workspace.tabs[0].root_pane;
             let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
@@ -209,6 +209,7 @@ impl EmbeddedApp {
         if let Err(error) = self.app.start_embedded_opencode(
             &terminal_id,
             embedded_agent_name(self.targets.len()),
+            &execution.executable,
             &execution.opencode_arguments(),
             self.startup_timeout,
         ) {
@@ -348,7 +349,7 @@ impl EmbeddedApp {
     ) -> std::io::Result<TerminalId> {
         #[cfg(test)]
         if let Some(factory) = self.test_terminal_factory.as_mut() {
-            return factory(&mut self.app, working_directory);
+            return factory(&mut self.app, working_directory, extra_env);
         }
 
         let workspace =
@@ -548,10 +549,13 @@ mod tests {
     fn test_embedded_app() -> (
         EmbeddedApp,
         Arc<Mutex<Vec<tokio::sync::mpsc::Receiver<Bytes>>>>,
+        Arc<Mutex<Vec<Vec<(String, String)>>>>,
     ) {
         let inputs = Arc::new(Mutex::new(Vec::new()));
         let factory_inputs = inputs.clone();
-        let app = EmbeddedApp::new_for_test(move |app, working_directory| {
+        let launch_envs = Arc::new(Mutex::new(Vec::new()));
+        let factory_launch_envs = launch_envs.clone();
+        let app = EmbeddedApp::new_for_test(move |app, working_directory, extra_env| {
             let workspace = crate::workspace::Workspace::test_new("embedded");
             let pane_id = workspace.tabs[0].root_pane;
             let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
@@ -571,9 +575,10 @@ mod tests {
             let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
             app.terminal_runtimes.insert(terminal_id.clone(), runtime);
             factory_inputs.lock().unwrap().push(input);
+            factory_launch_envs.lock().unwrap().push(extra_env);
             Ok(terminal_id)
         });
-        (app, inputs)
+        (app, inputs, launch_envs)
     }
 
     fn target() -> LogicalTarget {
@@ -588,6 +593,7 @@ mod tests {
     ) -> crate::runtime::TargetExecutionConfig {
         crate::runtime::TargetExecutionConfig {
             working_directory: working_directory.into(),
+            executable: "/configured/opencode-wrapper".into(),
             agent: agent.into(),
             model: model.into(),
             session,
@@ -605,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_queues_prompt_bytes_then_enter() {
-        let (mut app, inputs) = test_embedded_app();
+        let (mut app, inputs, _) = test_embedded_app();
         let target = target();
         let turn_id = TurnId::new("turn").unwrap();
         app.add_ready_target_for_test(target.clone(), test_execution());
@@ -636,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_turn_settles_once() {
-        let (mut app, _) = test_embedded_app();
+        let (mut app, _, _) = test_embedded_app();
         let target = target();
         let turn_id = TurnId::new("turn").unwrap();
         app.add_ready_target_for_test(target.clone(), test_execution());
@@ -787,7 +793,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_rolls_back_terminal_and_workspace_when_opencode_start_rejects_arguments() {
-        let (mut app, _) = test_embedded_app();
+        let (mut app, _, _) = test_embedded_app();
         let execution = execution(
             "/work",
             "agent",
@@ -806,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_keeps_each_target_execution_snapshot_and_launch_directory() {
-        let (mut app, _) = test_embedded_app();
+        let (mut app, inputs, launch_envs) = test_embedded_app();
         let first = LogicalTarget::conversation("first").unwrap();
         let second = LogicalTarget::thread("second", "thread").unwrap();
         let first_execution = execution(
@@ -824,6 +830,28 @@ mod tests {
 
         app.open(first.clone(), first_execution.clone()).unwrap();
         app.open(second.clone(), second_execution.clone()).unwrap();
+
+        let mut first_input = inputs.lock().unwrap().remove(0);
+        let command = String::from_utf8(first_input.recv().await.unwrap().to_vec()).unwrap();
+        assert!(command.contains("/configured/opencode-wrapper"));
+        assert!(command.contains("--agent reviewer --model openai/gpt-5"));
+        let mut second_input = inputs.lock().unwrap().remove(0);
+        let command = String::from_utf8(second_input.recv().await.unwrap().to_vec()).unwrap();
+        assert!(command.contains("/configured/opencode-wrapper"));
+        assert!(command.contains("--session session-42"));
+        let first_env = launch_envs.lock().unwrap().remove(0);
+        let report_socket = first_env
+            .iter()
+            .find(|(key, _)| key == "HERDR_PANE_REPORT_SOCKET")
+            .unwrap()
+            .1
+            .clone();
+        let report_token = first_env
+            .iter()
+            .find(|(key, _)| key == "HERDR_PANE_REPORT_TOKEN")
+            .unwrap()
+            .1
+            .clone();
 
         assert_eq!(app.execution_for_test(&first), Some(&first_execution));
         assert_eq!(app.execution_for_test(&second), Some(&second_execution));
@@ -850,11 +878,39 @@ mod tests {
                 "session-42"
             ]
         );
+        let terminal_id = app.target_terminal_for_test(&first);
+        app.app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .persisted_agent_session = None;
+        assert!(!app.ready(&first));
+        let mut stream = crate::ipc::connect_local_stream(Path::new(&report_socket)).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "token": report_token,
+                "source": "herdr:opencode",
+                "agent": "opencode",
+                "seq": 1,
+                "agent_session_id": "session-42",
+                "session_start_source": "startup"
+            })
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !app.ready(&first) && std::time::Instant::now() < deadline {
+            app.pump(&HashMap::new());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(app.ready(&first));
     }
 
     #[tokio::test]
     async fn lost_target_mapping_is_removed_and_open_recreates_it() {
-        let (mut app, _) = test_embedded_app();
+        let (mut app, _, _) = test_embedded_app();
         let target = target();
         app.add_ready_target_for_test(target.clone(), test_execution());
         let old_terminal_id = app.targets[&target].terminal_id.clone();
@@ -878,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_drains_all_owned_terminal_runtimes() {
-        let (mut app, _) = test_embedded_app();
+        let (mut app, _, _) = test_embedded_app();
         app.add_ready_target_for_test(
             LogicalTarget::conversation("one").unwrap(),
             test_execution(),
@@ -895,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_shutdown_retains_owned_runtimes_for_a_checked_retry() {
-        let (mut app, _) = test_embedded_app();
+        let (mut app, _, _) = test_embedded_app();
         app.add_ready_target_for_test(target(), test_execution());
         app.fail_shutdown_for_test();
 

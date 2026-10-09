@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::{path::Path, time::{Duration, Instant}};
 
 use bytes::Bytes;
 
@@ -27,10 +27,14 @@ impl App {
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
         name: String,
+        executable: &Path,
         args: &[String],
         timeout: Duration,
     ) -> std::io::Result<()> {
-        if args.iter().any(|arg| arg.chars().any(char::is_control)) {
+        let executable = executable.to_string_lossy();
+        if executable.chars().any(char::is_control)
+            || args.iter().any(|arg| arg.chars().any(char::is_control))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "OpenCode arguments cannot contain control characters",
@@ -55,11 +59,7 @@ impl App {
         .ok_or_else(|| {
             std::io::Error::other("embedded terminal is not an interactive shell")
         })?;
-        let mut argv =
-            vec![
-                crate::detect::interactive_agent_executable(crate::detect::Agent::OpenCode)
-                    .to_string(),
-            ];
+        let mut argv = vec![executable.into_owned()];
         argv.extend(args.iter().cloned());
         let command =
             crate::platform::interactive_shell_command(&argv, &shell_name).ok_or_else(|| {
