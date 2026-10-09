@@ -14,6 +14,7 @@ mod version;
 pub(crate) use actions::{
     install_experimental_letta, install_target, uninstall_experimental_letta, uninstall_target,
 };
+pub(crate) use targets::install_opencode;
 #[cfg(test)]
 pub(crate) use env::integration_env_lock;
 pub(crate) use env::{
@@ -184,7 +185,7 @@ const OPENCODE_TUI_PLUGIN_ASSET: &str = include_str!("assets/opencode/herdr-tui-
 const OPENCODE_V2_TUI_PLUGIN_DIR: &str = "herdr-opencode";
 const OPENCODE_V2_TUI_PLUGIN_SPEC: &str = "./herdr-opencode";
 const OPENCODE_V2_TUI_PLUGIN_ASSET: &str = include_str!("assets/opencode/tui.js");
-const OPENCODE_INTEGRATION_VERSION: u32 = 14;
+const OPENCODE_INTEGRATION_VERSION: u32 = 15;
 const KILO_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.js";
 const KILO_PLUGIN_ASSET: &str = include_str!("assets/kilo/herdr-agent-state.js");
 const KILO_INTEGRATION_VERSION: u32 = 4;

@@ -182,6 +182,7 @@ impl EmbeddedApp {
         if self.targets.contains_key(&target) {
             return Ok(());
         }
+        crate::integration::install_opencode()?;
         let (reporter, report_env, pane) = super::embedded_report::PaneReportListener::start(
             self.app.event_tx.clone(),
             &self.state_path,
@@ -906,6 +907,95 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(app.ready(&first));
+    }
+
+    #[tokio::test]
+    async fn open_refreshes_the_plugin_and_receives_its_private_session_report() {
+        let _lock = crate::integration::integration_env_lock();
+        let base = std::env::temp_dir().join(format!(
+            "herdr-embedded-opencode-plugin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = base.join("home");
+        let config_dir = home.join(".config/opencode");
+        std::fs::create_dir_all(config_dir.join("plugins")).unwrap();
+        std::fs::write(
+            config_dir.join("plugins/herdr-agent-state.js"),
+            "// stale plugin without private reports\n",
+        )
+        .unwrap();
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let (mut app, _, launch_envs) = test_embedded_app();
+        let target = target();
+        app.open(target.clone(), test_execution()).unwrap();
+        let launch_env = launch_envs.lock().unwrap().remove(0);
+        let socket = launch_env
+            .iter()
+            .find(|(key, _)| key == "HERDR_PANE_REPORT_SOCKET")
+            .unwrap()
+            .1
+            .clone();
+        let token = launch_env
+            .iter()
+            .find(|(key, _)| key == "HERDR_PANE_REPORT_TOKEN")
+            .unwrap()
+            .1
+            .clone();
+        let terminal_id = app.target_terminal_for_test(&target);
+        app.app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .persisted_agent_session = None;
+        std::fs::write(
+            base.join("report.mjs"),
+            concat!(
+                "process.argv = [process.argv[0], process.argv[1], 'run'];\n",
+                "const { HerdrAgentStatePlugin } = await import('./plugin.mjs');\n",
+                "const plugin = await HerdrAgentStatePlugin();\n",
+                "await plugin.event({ event: { type: 'session.updated', properties: { sessionID: 'ses_plugin' } } });\n",
+            ),
+        )
+        .unwrap();
+        std::fs::copy(
+            config_dir.join("plugins/herdr-agent-state.js"),
+            base.join("plugin.mjs"),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("node")
+            .arg("report.mjs")
+            .current_dir(&base)
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_REPORT_SOCKET", socket)
+            .env("HERDR_PANE_REPORT_TOKEN", token)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "plugin failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !app.ready(&target) && std::time::Instant::now() < deadline {
+            app.pump(&HashMap::new());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(app.ready(&target));
+        app.shutdown().unwrap();
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
