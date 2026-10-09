@@ -2449,7 +2449,7 @@ fn opencode_reuses_json_registration_in_symlinked_config_directory() {
 }
 
 #[test]
-fn opencode_install_defers_v2_registration_while_migration_pending() {
+fn opencode_install_registers_v2_plugin_while_legacy_tui_settings_exist() {
     let _lock = integration_env_lock();
     let base = unique_base();
     let home = base.join("home");
@@ -2460,8 +2460,12 @@ fn opencode_install_defers_v2_registration_while_migration_pending() {
 
     let installed = install_opencode().unwrap();
 
-    assert!(installed.cli_config_path.is_none());
-    assert!(!opencode_dir.join("cli.json").exists());
+    let cli_config_path = installed
+        .cli_config_path
+        .expect("V2 OpenCode must load the TUI plugin from cli.json");
+    let cli_config: Value =
+        serde_json::from_str(&fs::read_to_string(cli_config_path).unwrap()).unwrap();
+    assert_eq!(cli_config["plugins"], json!([OPENCODE_V2_TUI_PLUGIN_SPEC]));
     assert!(opencode_dir
         .join(OPENCODE_V2_TUI_PLUGIN_DIR)
         .join("tui.js")
