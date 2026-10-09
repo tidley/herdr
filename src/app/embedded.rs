@@ -45,10 +45,7 @@ impl EmbeddedApp {
     pub(crate) fn new(config: &RuntimeConfig) -> std::io::Result<Self> {
         std::fs::create_dir_all(&config.state_path)?;
         std::fs::create_dir_all(&config.data_path)?;
-        let mut app_config = crate::config::Config::default();
-        if let Some(command) = &config.terminal.command {
-            app_config.terminal.default_shell = command.to_string_lossy().into_owned();
-        }
+        let app_config = crate::config::Config::default();
         let app = App::try_new(
             &app_config,
             AppPolicy::EMBEDDED,
@@ -762,6 +759,30 @@ mod tests {
         assert!(data_path.is_dir());
         drop(app);
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(unique));
+    }
+
+    #[tokio::test]
+    async fn open_launches_opencode_from_an_interactive_shell() {
+        let unique = format!("herdr-embedded-shell-{}", std::process::id());
+        let root = std::env::temp_dir().join(unique);
+        let config = RuntimeConfig {
+            state_path: root.join("state"),
+            data_path: root.join("data"),
+            terminal: crate::runtime::TerminalConfig {
+                command: Some("opencode".into()),
+            },
+            ..RuntimeConfig::default()
+        };
+        let mut app = EmbeddedApp::new(&config).unwrap();
+
+        let result = app.open(target(), test_execution());
+
+        app.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            result.is_ok(),
+            "embedded target must start from a shell: {result:?}"
+        );
     }
 
     #[tokio::test]
